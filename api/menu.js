@@ -1,11 +1,8 @@
 // ─────────────────────────────────────────────
 //  FAMILY HOTLINE — Telnyx / Vercel Function
-//  Drop this file into your Vercel project at:
-//  /api/menu.js
 // ─────────────────────────────────────────────
 
 const https = require('https');
-
 const FB_DB = 'ai-1-46a29-default-rtdb.firebaseio.com';
 
 // ── Firebase helpers ──────────────────────────
@@ -52,11 +49,29 @@ function fbIncrement(path) {
   return fbGet(path).then(v => fbSet(path, (parseInt(v) || 0) + 1));
 }
 
+// ── Parse request body from Telnyx (form-encoded) ──
+
+function parseBody(req) {
+  return new Promise((resolve) => {
+    let raw = '';
+    req.on('data', chunk => (raw += chunk));
+    req.on('end', () => {
+      try {
+        const params = {};
+        new URLSearchParams(raw).forEach((v, k) => { params[k] = v; });
+        resolve(params);
+      } catch (e) {
+        resolve({});
+      }
+    });
+  });
+}
+
 // ── TeXML menu builder ────────────────────────
 
-function buildMenuTeXML(baseUrl, menuId, menu, menuAudio) {
+function buildMenuTeXML(baseUrl, menuId, menuAudio) {
   const actionUrl = `${baseUrl}?menuId=${menuId}`;
-  const greeting  = menuAudio?.greeting
+  const greeting = menuAudio?.greeting
     ? `<Play>${menuAudio.greeting}</Play>`
     : `<Say>Welcome. Please press or say a number to continue. Press 0 at any time to return to the main menu.</Say>`;
 
@@ -64,7 +79,6 @@ function buildMenuTeXML(baseUrl, menuId, menu, menuAudio) {
 <Response>
   <Gather input="dtmf speech" numDigits="2" timeout="10" speechTimeout="auto" action="${actionUrl}" method="POST">
     ${greeting}
-    <Say>Press 0 to return to the main menu.</Say>
   </Gather>
   <Redirect method="POST">${actionUrl}</Redirect>
 </Response>`;
@@ -73,8 +87,11 @@ function buildMenuTeXML(baseUrl, menuId, menu, menuAudio) {
 // ── Main handler ──────────────────────────────
 
 module.exports = async function handler(req, res) {
-  const params  = req.body || {};
-  const menuId  = params.menuId  || req.query?.menuId  || 'main';
+  // Parse body manually — Vercel doesn't auto-parse form data
+  const params  = await parseBody(req);
+  const query   = req.query || {};
+
+  const menuId  = params.menuId  || query.menuId  || 'main';
   const digits  = (params.Digits || params.digits || '').trim();
   const speech  = (params.SpeechResult || params.speech_result || '').trim().toLowerCase();
   const input   = digits || speech;
@@ -106,8 +123,10 @@ module.exports = async function handler(req, res) {
     }
 
     // ── Whisper callback ──
-    if (params.whisper === '1') {
-      const whisperAudio = audio[menuId]?.['whisper_' + params.digit];
+    if (params.whisper === '1' || query.whisper === '1') {
+      const digit = params.digit || query.digit;
+      const mid   = params.menuId || query.menuId || 'main';
+      const whisperAudio = audio[mid]?.['whisper_' + digit];
       return res.end(`<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   ${whisperAudio ? `<Play>${whisperAudio}</Play>` : '<Say>Connecting you now.</Say>'}
@@ -115,12 +134,14 @@ module.exports = async function handler(req, res) {
     }
 
     // ── Save voicemail ──
-    if (params.vm === '1' && params.RecordingUrl) {
+    const isVm = params.vm === '1' || query.vm === '1';
+    if (isVm && (params.RecordingUrl || params.recording_url)) {
+      const recUrl = params.RecordingUrl || params.recording_url;
       const id = Date.now().toString();
       await fbSet('/hotline/voicemails/' + id, {
         id,
-        url:      params.RecordingUrl,
-        duration: params.RecordingDuration || '0',
+        url:      recUrl,
+        duration: params.RecordingDuration || params.recording_duration || '0',
         from:     fromNum,
         date:     new Date().toISOString(),
         heard:    false,
@@ -135,7 +156,7 @@ module.exports = async function handler(req, res) {
     // ── Handle input ──
     if (input) {
 
-      // 🔑 PRESS 0 = back to main menu (works from any screen)
+      // 0 = back to main menu from anywhere
       if (digits === '0' || speech.includes('main menu') || speech.includes('go back') || speech.includes('zero')) {
         return res.end(`<?xml version="1.0" encoding="UTF-8"?>
 <Response>
@@ -144,7 +165,7 @@ module.exports = async function handler(req, res) {
 </Response>`);
       }
 
-      // Extract key number
+      // Extract key
       let key = digits.replace(/[^0-9]/g, '').slice(0, 2);
       if (!key) {
         const m = speech.match(/\b(\d{1,2})\b/);
@@ -175,8 +196,6 @@ module.exports = async function handler(req, res) {
         (button.label || key).replace(/[^a-zA-Z0-9]/g, '').slice(0, 20)
       ).catch(() => {});
 
-      // ── Button types ──────────────────────────
-
       switch (button.type) {
 
         case 'recording': {
@@ -186,7 +205,7 @@ module.exports = async function handler(req, res) {
 <Response>
   <Gather input="dtmf speech" numDigits="2" timeout="8" speechTimeout="auto" action="${baseUrl}?menuId=${menuId}" method="POST">
     <Play>${rec}</Play>
-    <Say>Press a number or say main menu to continue. Press 0 to return to the main menu.</Say>
+    <Say>Press 0 to return to the main menu.</Say>
   </Gather>
   <Redirect method="POST">${baseUrl}?menuId=${menuId}</Redirect>
 </Response>`);
@@ -249,7 +268,7 @@ module.exports = async function handler(req, res) {
 <Response>
   <Gather input="dtmf speech" numDigits="2" timeout="8" speechTimeout="auto" action="${baseUrl}?menuId=${menuId}" method="POST">
     <Say>${text}</Say>
-    <Say>Press 0 to return to the main menu, or press any key to continue.</Say>
+    <Say>Press 0 to return to the main menu.</Say>
   </Gather>
   <Redirect method="POST">${baseUrl}?menuId=${menuId}</Redirect>
 </Response>`);
@@ -294,7 +313,7 @@ module.exports = async function handler(req, res) {
     }
 
     // ── No input — play the menu ──
-    return res.end(buildMenuTeXML(baseUrl, menuId, menu, audio[menuId]));
+    return res.end(buildMenuTeXML(baseUrl, menuId, audio[menuId]));
 
   } catch (err) {
     console.error('Hotline error:', err);
