@@ -1,9 +1,14 @@
 // ─────────────────────────────────────────────
-//  FAMILY HOTLINE — Telnyx / Vercel Function
+//  FAMILY HOTLINE — Render / Firebase
+//  Start command: node api/menu.js
 // ─────────────────────────────────────────────
 
-const https = require('https');
-const FB_DB = 'ai-1-46a29-default-rtdb.firebaseio.com';
+const https  = require('https');
+const http   = require('http');
+const url    = require('url');
+
+const FB_DB  = 'ai-1-46a29-default-rtdb.firebaseio.com';
+const PORT   = process.env.PORT || 3000;
 
 // ── Firebase helpers ──────────────────────────
 
@@ -49,7 +54,7 @@ function fbIncrement(path) {
   return fbGet(path).then(v => fbSet(path, (parseInt(v) || 0) + 1));
 }
 
-// ── Parse request body from Telnyx (form-encoded) ──
+// ── Parse form body from Telnyx ───────────────
 
 function parseBody(req) {
   return new Promise((resolve) => {
@@ -60,9 +65,7 @@ function parseBody(req) {
         const params = {};
         new URLSearchParams(raw).forEach((v, k) => { params[k] = v; });
         resolve(params);
-      } catch (e) {
-        resolve({});
-      }
+      } catch (e) { resolve({}); }
     });
   });
 }
@@ -71,10 +74,9 @@ function parseBody(req) {
 
 function buildMenuTeXML(baseUrl, menuId, menuAudio) {
   const actionUrl = `${baseUrl}?menuId=${menuId}`;
-  const greeting = menuAudio?.greeting
+  const greeting  = menuAudio?.greeting
     ? `<Play>${menuAudio.greeting}</Play>`
     : `<Say>Welcome. Please press or say a number to continue. Press 0 at any time to return to the main menu.</Say>`;
-
   return `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Gather input="dtmf speech" numDigits="2" timeout="10" speechTimeout="auto" action="${actionUrl}" method="POST">
@@ -84,19 +86,47 @@ function buildMenuTeXML(baseUrl, menuId, menuAudio) {
 </Response>`;
 }
 
-// ── Main handler ──────────────────────────────
+// ── XML shortcut ──────────────────────────────
 
-module.exports = async function handler(req, res) {
-  // Parse body manually — Vercel doesn't auto-parse form data
-  const params  = await parseBody(req);
-  const query   = req.query || {};
+function say(text, redirect) {
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say>${text}</Say>
+  ${redirect ? `<Redirect method="POST">${redirect}</Redirect>` : '<Hangup/>'}
+</Response>`;
+}
 
-  const menuId  = params.menuId  || query.menuId  || 'main';
+// ── HTTP Server ───────────────────────────────
+
+const server = http.createServer(async (req, res) => {
+
+  // Health check — lets Render know the service is alive
+  if (req.url === '/' || req.url === '/health') {
+    res.writeHead(200);
+    return res.end('Family Hotline is running!');
+  }
+
+  // Only handle /menu
+  if (!req.url.startsWith('/menu') && !req.url.startsWith('/api/menu')) {
+    res.writeHead(404);
+    return res.end('Not found');
+  }
+
+  const parsed  = url.parse(req.url, true);
+  const query   = parsed.query || {};
+  const body    = await parseBody(req);
+  const params  = { ...query, ...body };
+
+  const menuId  = params.menuId  || 'main';
   const digits  = (params.Digits || params.digits || '').trim();
   const speech  = (params.SpeechResult || params.speech_result || '').trim().toLowerCase();
   const input   = digits || speech;
   const fromNum = params.From || params.from || 'Unknown';
-  const baseUrl = `https://${req.headers.host}/api/menu`;
+
+  // Build base URL from the incoming request
+  const proto   = req.headers['x-forwarded-proto'] || 'https';
+  const host    = req.headers['x-forwarded-host']  || req.headers.host;
+  const baseUrl = `${proto}://${host}/menu`;
 
   res.setHeader('Content-Type', 'text/xml');
 
@@ -108,64 +138,48 @@ module.exports = async function handler(req, res) {
     const menu     = menus[menuId];
     const COMING   = settings.comingSoon || 'This option is coming soon. Please try another option.';
 
-    // ── Menu not found ──
+    // Menu not found
     if (!menu) {
-      return res.end(`<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Say>Sorry, that menu could not be found. Returning to the main menu.</Say>
-  <Redirect method="POST">${baseUrl}?menuId=main</Redirect>
-</Response>`);
+      return res.end(say('Sorry, that menu could not be found. Returning to the main menu.', `${baseUrl}?menuId=main`));
     }
 
-    // ── Track new call ──
+    // Track new call
     if (!input && menuId === 'main' && !params.vm) {
       fbIncrement('/hotline/analytics/_calls').catch(() => {});
     }
 
-    // ── Whisper callback ──
-    if (params.whisper === '1' || query.whisper === '1') {
-      const digit = params.digit || query.digit;
-      const mid   = params.menuId || query.menuId || 'main';
-      const whisperAudio = audio[mid]?.['whisper_' + digit];
+    // Whisper callback
+    if (params.whisper === '1') {
+      const whisperAudio = audio[params.menuId || 'main']?.['whisper_' + params.digit];
       return res.end(`<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   ${whisperAudio ? `<Play>${whisperAudio}</Play>` : '<Say>Connecting you now.</Say>'}
 </Response>`);
     }
 
-    // ── Save voicemail ──
-    const isVm = params.vm === '1' || query.vm === '1';
-    if (isVm && (params.RecordingUrl || params.recording_url)) {
-      const recUrl = params.RecordingUrl || params.recording_url;
+    // Save voicemail
+    if (params.vm === '1' && (params.RecordingUrl || params.recording_url)) {
       const id = Date.now().toString();
       await fbSet('/hotline/voicemails/' + id, {
         id,
-        url:      recUrl,
-        duration: params.RecordingDuration || params.recording_duration || '0',
+        url:      params.RecordingUrl || params.recording_url,
+        duration: params.RecordingDuration || '0',
         from:     fromNum,
         date:     new Date().toISOString(),
         heard:    false,
       });
-      return res.end(`<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Say>Your message has been saved. Thank you for calling.</Say>
-  <Redirect method="POST">${baseUrl}?menuId=main</Redirect>
-</Response>`);
+      return res.end(say('Your message has been saved. Thank you for calling.', `${baseUrl}?menuId=main`));
     }
 
-    // ── Handle input ──
+    // Handle input
     if (input) {
 
       // 0 = back to main menu from anywhere
       if (digits === '0' || speech.includes('main menu') || speech.includes('go back') || speech.includes('zero')) {
-        return res.end(`<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Say>Returning to the main menu.</Say>
-  <Redirect method="POST">${baseUrl}?menuId=main</Redirect>
-</Response>`);
+        return res.end(say('Returning to the main menu.', `${baseUrl}?menuId=main`));
       }
 
-      // Extract key
+      // Extract key number
       let key = digits.replace(/[^0-9]/g, '').slice(0, 2);
       if (!key) {
         const m = speech.match(/\b(\d{1,2})\b/);
@@ -173,21 +187,13 @@ module.exports = async function handler(req, res) {
       }
 
       if (!key) {
-        return res.end(`<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Say>Sorry, I did not catch that. Please try again.</Say>
-  <Redirect method="POST">${baseUrl}?menuId=${menuId}</Redirect>
-</Response>`);
+        return res.end(say('Sorry, I did not catch that. Please try again.', `${baseUrl}?menuId=${menuId}`));
       }
 
       const button = menu.buttons?.[key];
 
       if (!button) {
-        return res.end(`<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Say>${COMING}</Say>
-  <Redirect method="POST">${baseUrl}?menuId=${menuId}</Redirect>
-</Response>`);
+        return res.end(say(COMING, `${baseUrl}?menuId=${menuId}`));
       }
 
       // Track analytics
@@ -210,8 +216,7 @@ module.exports = async function handler(req, res) {
   <Redirect method="POST">${baseUrl}?menuId=${menuId}</Redirect>
 </Response>`);
           }
-          return res.end(`<?xml version="1.0" encoding="UTF-8"?>
-<Response><Say>${COMING}</Say><Redirect method="POST">${baseUrl}?menuId=${menuId}</Redirect></Response>`);
+          return res.end(say(COMING, `${baseUrl}?menuId=${menuId}`));
         }
 
         case 'submenu': {
@@ -221,8 +226,7 @@ module.exports = async function handler(req, res) {
   <Redirect method="POST">${baseUrl}?menuId=${button.menuId}</Redirect>
 </Response>`);
           }
-          return res.end(`<?xml version="1.0" encoding="UTF-8"?>
-<Response><Say>${COMING}</Say><Redirect method="POST">${baseUrl}?menuId=${menuId}</Redirect></Response>`);
+          return res.end(say(COMING, `${baseUrl}?menuId=${menuId}`));
         }
 
         case 'forward': {
@@ -233,8 +237,7 @@ module.exports = async function handler(req, res) {
   <Dial>${button.forwardTo}</Dial>
 </Response>`);
           }
-          return res.end(`<?xml version="1.0" encoding="UTF-8"?>
-<Response><Say>${COMING}</Say><Redirect method="POST">${baseUrl}?menuId=${menuId}</Redirect></Response>`);
+          return res.end(say(COMING, `${baseUrl}?menuId=${menuId}`));
         }
 
         case 'transfer': {
@@ -250,8 +253,7 @@ module.exports = async function handler(req, res) {
   <Dial>${numberTag}</Dial>
 </Response>`);
           }
-          return res.end(`<?xml version="1.0" encoding="UTF-8"?>
-<Response><Say>${COMING}</Say><Redirect method="POST">${baseUrl}?menuId=${menuId}</Redirect></Response>`);
+          return res.end(say(COMING, `${baseUrl}?menuId=${menuId}`));
         }
 
         case 'voicemail': {
@@ -307,20 +309,19 @@ module.exports = async function handler(req, res) {
         }
 
         default:
-          return res.end(`<?xml version="1.0" encoding="UTF-8"?>
-<Response><Say>${COMING}</Say><Redirect method="POST">${baseUrl}?menuId=${menuId}</Redirect></Response>`);
+          return res.end(say(COMING, `${baseUrl}?menuId=${menuId}`));
       }
     }
 
-    // ── No input — play the menu ──
+    // No input — play the menu
     return res.end(buildMenuTeXML(baseUrl, menuId, audio[menuId]));
 
   } catch (err) {
     console.error('Hotline error:', err);
-    return res.end(`<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Say>Sorry, there was a technical problem. Please call back in a moment.</Say>
-  <Hangup/>
-</Response>`);
+    return res.end(say('Sorry, there was a technical problem. Please call back in a moment.'));
   }
-};
+});
+
+server.listen(PORT, () => {
+  console.log(`Family Hotline running on port ${PORT}`);
+});
