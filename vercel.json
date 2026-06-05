@@ -1,9 +1,6 @@
 {
   "version": 2,
-  "functions": {
-    "api/menu.js": {
-      "memory": 256,
-      "maxDuration": 15
-    }
-  }
+  "rewrites": [
+    { "source": "/api/menu", "destination": "/api/menu.js" }
+  ]
 }
