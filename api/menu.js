@@ -157,13 +157,18 @@ const server = http.createServer(async (req, res) => {
 </Response>`);
     }
 
-    // Save voicemail
-    if (params.vm === '1' && (params.RecordingUrl || params.recording_url)) {
+    // Save voicemail — Telnyx sends recording_url, Twilio sends RecordingUrl
+    const recUrl = params.RecordingUrl || params.recording_url || params.recordingUrl;
+    if (params.vm === '1' && recUrl) {
       const id = Date.now().toString();
+      // Append .mp3 to Telnyx URLs so browsers can play them directly
+      const playableUrl = recUrl.includes('telnyx.com') && !recUrl.endsWith('.mp3')
+        ? recUrl + '.mp3'
+        : recUrl;
       await fbSet('/hotline/voicemails/' + id, {
         id,
-        url:      params.RecordingUrl || params.recording_url,
-        duration: params.RecordingDuration || '0',
+        url:      playableUrl,
+        duration: params.RecordingDuration || params.recording_duration || '0',
         from:     fromNum,
         date:     new Date().toISOString(),
         heard:    false,
@@ -234,7 +239,9 @@ const server = http.createServer(async (req, res) => {
             return res.end(`<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Say>Please hold while we connect you.</Say>
-  <Dial>${button.forwardTo}</Dial>
+  <Dial timeout="30" answerOnBridge="true">
+    <Number>${button.forwardTo}</Number>
+  </Dial>
 </Response>`);
           }
           return res.end(say(COMING, `${baseUrl}?menuId=${menuId}`));
@@ -250,7 +257,7 @@ const server = http.createServer(async (req, res) => {
             return res.end(`<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Say>Please hold while we transfer your call.</Say>
-  <Dial>${numberTag}</Dial>
+  <Dial timeout="30" answerOnBridge="true">${numberTag}</Dial>
 </Response>`);
           }
           return res.end(say(COMING, `${baseUrl}?menuId=${menuId}`));
