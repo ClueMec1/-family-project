@@ -96,6 +96,20 @@ function say(text, redirect) {
 </Response>`;
 }
 
+// ── PIN entry prompt builder ───────────────────
+// Used for both the whole-hotline entry PIN and locked sub-menu PINs.
+function buildPinPrompt(baseUrl, actionTarget, attemptsLeft, promptText) {
+  const actionUrl = `${baseUrl}?pinCheck=1&target=${encodeURIComponent(actionTarget)}&attemptsLeft=${attemptsLeft}`;
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Gather input="dtmf" numDigits="4" timeout="10" action="${actionUrl}" method="POST">
+    <Say>${promptText}</Say>
+  </Gather>
+  <Say>We did not receive any input.</Say>
+  <Redirect method="POST">${actionUrl}</Redirect>
+</Response>`;
+}
+
 // ── HTTP Server ───────────────────────────────
 
 const server = http.createServer(async (req, res) => {
@@ -135,16 +149,76 @@ const server = http.createServer(async (req, res) => {
     const menus    = hotline?.menus    || {};
     const settings = hotline?.settings || {};
     const audio    = hotline?.audio    || {};
-    const menu     = menus[menuId];
+    const boards   = hotline?.messageBoards || {};
     const COMING   = settings.comingSoon || 'This option is coming soon. Please try another option.';
+
+    // ──────────────────────────────────────────
+    // PIN CHECK HANDLER (shared by entry PIN + locked sub-menus)
+    // ──────────────────────────────────────────
+    if (params.pinCheck === '1') {
+      const target       = params.target || 'main';       // where to go if correct
+      const attemptsLeft = parseInt(params.attemptsLeft || '3', 10);
+      const enteredPin   = digits;
+
+      // Figure out which PIN we're checking against
+      let correctPin = null;
+      if (target === 'ENTRY') {
+        correctPin = settings.callPin || '';
+      } else {
+        // target is a locked menu id — find the button that points to it to get its PIN
+        const lockedMenu = menus[target];
+        correctPin = lockedMenu?._lockPin || null;
+        // fallback: search all buttons for one pointing at this menuId with a lockPin
+        if (correctPin === null) {
+          for (const mId in menus) {
+            const btns = menus[mId].buttons || {};
+            for (const k in btns) {
+              if (btns[k].type === 'lockedmenu' && btns[k].menuId === target) {
+                correctPin = btns[k].lockPin;
+              }
+            }
+          }
+        }
+      }
+
+      if (!enteredPin || enteredPin !== correctPin) {
+        const remaining = attemptsLeft - 1;
+        if (remaining <= 0) {
+          return res.end(say('Incorrect PIN entered too many times. Goodbye.'));
+        }
+        return res.end(buildPinPrompt(
+          baseUrl, target, remaining,
+          `Incorrect PIN. You have ${remaining} ${remaining === 1 ? 'try' : 'tries'} left. Please enter the 4 digit PIN.`
+        ));
+      }
+
+      // Correct PIN — go to the target menu
+      const destMenuId = target === 'ENTRY' ? 'main' : target;
+      return res.end(`<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Redirect method="POST">${baseUrl}?menuId=${destMenuId}</Redirect>
+</Response>`);
+    }
+
+    // ──────────────────────────────────────────
+    // WHOLE-HOTLINE ENTRY PIN GATE
+    // Fires on the very first hit to /menu (no menuId param at all means fresh call)
+    // ──────────────────────────────────────────
+    const isFreshCall = !query.menuId && !body.menuId && !input && !params.vm && !params.whisper && !params.pinCheck;
+    if (isFreshCall && settings.callPin) {
+      fbIncrement('/hotline/analytics/_calls').catch(() => {});
+      return res.end(buildPinPrompt(baseUrl, 'ENTRY', 3, 'Welcome. Please enter the 4 digit PIN to continue.'));
+    }
+
+    const menu = menus[menuId];
 
     // Menu not found
     if (!menu) {
       return res.end(say('Sorry, that menu could not be found. Returning to the main menu.', `${baseUrl}?menuId=main`));
     }
 
-    // Track new call
-    if (!input && menuId === 'main' && !params.vm) {
+    // Track new call (only if no entry PIN was required, since that path tracks above)
+    if (!input && menuId === 'main' && !params.vm && !settings.callPin) {
       fbIncrement('/hotline/analytics/_calls').catch(() => {});
     }
 
@@ -157,11 +231,12 @@ const server = http.createServer(async (req, res) => {
 </Response>`);
     }
 
-    // Save voicemail — Telnyx sends recording_url, Twilio sends RecordingUrl
+    // ──────────────────────────────────────────
+    // PRIVATE VOICEMAIL — save recording (only host hears these)
+    // ──────────────────────────────────────────
     const recUrl = params.RecordingUrl || params.recording_url || params.recordingUrl;
     if (params.vm === '1' && recUrl) {
       const id = Date.now().toString();
-      // Append .mp3 to Telnyx URLs so browsers can play them directly
       const playableUrl = recUrl.includes('telnyx.com') && !recUrl.endsWith('.mp3')
         ? recUrl + '.mp3'
         : recUrl;
@@ -176,11 +251,71 @@ const server = http.createServer(async (req, res) => {
       return res.end(say('Your message has been saved. Thank you for calling.', `${baseUrl}?menuId=main`));
     }
 
-    // Handle input
+    // ──────────────────────────────────────────
+    // MESSAGE BOARD — save a new message (everyone can hear these)
+    // ──────────────────────────────────────────
+    if (params.boardmsg === '1' && recUrl) {
+      const boardId = params.boardId;
+      const id = Date.now().toString();
+      const playableUrl = recUrl.includes('telnyx.com') && !recUrl.endsWith('.mp3')
+        ? recUrl + '.mp3'
+        : recUrl;
+      await fbSet(`/hotline/messageBoards/${boardId}/${id}`, {
+        id,
+        url:      playableUrl,
+        duration: params.RecordingDuration || params.recording_duration || '0',
+        from:     fromNum,
+        date:     new Date().toISOString(),
+      });
+      return res.end(say('Your message has been added to the board. Thank you!', `${baseUrl}?menuId=${params.menuId || 'main'}`));
+    }
+
+    // ──────────────────────────────────────────
+    // MESSAGE BOARD — play messages with skip controls
+    // 2 = skip ahead, 1 = go back, 0 = main menu
+    // ──────────────────────────────────────────
+    if (params.boardplay === '1') {
+      const boardId = params.boardId;
+      const boardMsgs = boards[boardId] || {};
+      let msgList = Object.values(boardMsgs).sort((a, b) => b.date.localeCompare(a.date)); // newest first
+
+      let idx = parseInt(params.idx || '0', 10);
+
+      // Handle navigation input
+      if (digits === '2') idx = idx + 1;        // skip ahead (older)
+      else if (digits === '1') idx = Math.max(0, idx - 1); // go back (newer)
+      else if (digits === '0') {
+        return res.end(say('Returning to the main menu.', `${baseUrl}?menuId=main`));
+      }
+
+      if (!msgList.length) {
+        return res.end(say('There are no messages on this board yet.', `${baseUrl}?menuId=${params.menuId || 'main'}`));
+      }
+
+      if (idx >= msgList.length) {
+        return res.end(say('That was the last message.', `${baseUrl}?boardplay=1&boardId=${boardId}&idx=0&menuId=${params.menuId || 'main'}`));
+      }
+
+      const msg = msgList[idx];
+      const actionUrl = `${baseUrl}?boardplay=1&boardId=${boardId}&idx=${idx}&menuId=${params.menuId || 'main'}`;
+      return res.end(`<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Gather input="dtmf" numDigits="1" timeout="8" action="${actionUrl}" method="POST">
+    <Say>Message ${idx + 1} of ${msgList.length}, from ${msg.from}.</Say>
+    <Play>${msg.url}</Play>
+    <Say>Press 2 for the next message. Press 1 to go back. Press 0 for the main menu.</Say>
+  </Gather>
+  <Redirect method="POST">${actionUrl}</Redirect>
+</Response>`);
+    }
+
+    // ──────────────────────────────────────────
+    // Handle digit/speech input on a normal menu
+    // ──────────────────────────────────────────
     if (input) {
 
-      // 0 = back to main menu from anywhere
-      if (digits === '0' || speech.includes('main menu') || speech.includes('go back') || speech.includes('zero')) {
+      // 0 or * = back to main menu from anywhere
+      if (digits === '0' || digits === '*' || speech.includes('main menu') || speech.includes('go back') || speech.includes('zero')) {
         return res.end(say('Returning to the main menu.', `${baseUrl}?menuId=main`));
       }
 
@@ -234,6 +369,17 @@ const server = http.createServer(async (req, res) => {
           return res.end(say(COMING, `${baseUrl}?menuId=${menuId}`));
         }
 
+        // PIN-protected sub-menu — ask for the PIN before entering
+        case 'lockedmenu': {
+          if (button.menuId && menus[button.menuId] && button.lockPin) {
+            return res.end(buildPinPrompt(
+              baseUrl, button.menuId, 3,
+              'This menu is protected. Please enter the 4 digit PIN.'
+            ));
+          }
+          return res.end(say(COMING, `${baseUrl}?menuId=${menuId}`));
+        }
+
         case 'forward': {
           if (button.forwardTo) {
             return res.end(`<?xml version="1.0" encoding="UTF-8"?>
@@ -263,11 +409,25 @@ const server = http.createServer(async (req, res) => {
           return res.end(say(COMING, `${baseUrl}?menuId=${menuId}`));
         }
 
+        // Private voicemail — only the host hears these in the dashboard
         case 'voicemail': {
           return res.end(`<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Say>Please leave your message after the beep. Press pound when you are done.</Say>
   <Record action="${baseUrl}?menuId=${menuId}&amp;vm=1&amp;from=${encodeURIComponent(fromNum)}" method="POST" finishOnKey="#" maxLength="180" playBeep="true"/>
+</Response>`);
+        }
+
+        // Message board — everyone can leave AND hear messages
+        case 'messageboard': {
+          const boardId = button.boardId;
+          const actionUrl = `${baseUrl}?menuId=${menuId}`;
+          return res.end(`<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Gather input="dtmf" numDigits="1" timeout="8" action="${actionUrl}&amp;boardChoice=1&amp;boardId=${boardId}" method="POST">
+    <Say>To leave a message, press 1. To hear messages, press 2.</Say>
+  </Gather>
+  <Redirect method="POST">${actionUrl}</Redirect>
 </Response>`);
         }
 
@@ -318,6 +478,28 @@ const server = http.createServer(async (req, res) => {
         default:
           return res.end(say(COMING, `${baseUrl}?menuId=${menuId}`));
       }
+    }
+
+    // ──────────────────────────────────────────
+    // Message board sub-choice handler (1 = leave, 2 = hear)
+    // ──────────────────────────────────────────
+    if (params.boardChoice === '1') {
+      const boardId = params.boardId;
+      if (digits === '1') {
+        // Leave a message
+        return res.end(`<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say>Please leave your message after the beep. Press pound when you are done.</Say>
+  <Record action="${baseUrl}?menuId=${menuId}&amp;boardmsg=1&amp;boardId=${boardId}&amp;from=${encodeURIComponent(fromNum)}" method="POST" finishOnKey="#" maxLength="180" playBeep="true"/>
+</Response>`);
+      } else if (digits === '2') {
+        // Hear messages, newest first, starting at index 0
+        return res.end(`<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Redirect method="POST">${baseUrl}?boardplay=1&amp;boardId=${boardId}&amp;idx=0&amp;menuId=${menuId}</Redirect>
+</Response>`);
+      }
+      return res.end(say('Sorry, I did not catch that.', `${baseUrl}?menuId=${menuId}`));
     }
 
     // No input — play the menu
