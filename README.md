@@ -39,6 +39,41 @@ history, and the app's "am I onboarded" state. Those all live in `localStorage`.
 6. Recents are written locally by whichever side notices the call end
    (answered / no-answer / declined / missed).
 
+## Recent fixes
+
+- **Call button no longer hidden behind the bottom bar** — the keypad screen
+  now reserves the same bottom space the other tabs already used, so the
+  call button sits fully above the navigation bar.
+- **Looks right on tablets/computers** — above phone width, the app now shows
+  as a fixed, phone-sized card centered on the screen instead of stretching
+  into a thin strip the full height of the window.
+- **Screen Wake Lock** — while a call is ringing, dialing, or connected, the
+  app now asks the phone to keep the screen on (`navigator.wakeLock`). The
+  most common reason a call "went silent" was simply the screen locking
+  itself from inactivity mid-call, which throttles the page. This fixes
+  that specific case. It does **not** keep a call alive if someone
+  deliberately leaves the app (home button, switching to another app) —
+  see "Known limitations" below, that part is a phone privacy protection,
+  not something a website can override.
+- **Incoming-call notifications** — if the app is open in another tab, another
+  window, or the phone's app switcher (but not fully closed), an incoming
+  call now shows a real system notification, and tapping it brings the app
+  back to the front. The app asks for notification permission once, right
+  after you finish onboarding (or on your next open if you already have a
+  profile).
+
+- **"Mini window" button during a call** — a new button next to Mute and
+  Speaker uses the browser's Picture-in-Picture feature to float a small
+  window (showing who you're talking to and the call timer) on top of
+  whatever else is on screen, so you can check a text or open another app
+  without losing the call view. The audio itself was already flowing through
+  a separate hidden audio element, so it isn't affected by this — the mini
+  window is just what keeps the page (and the call) alive and visible while
+  you're elsewhere on the phone. Works well on Android and on
+  computers (Chrome/Edge). On iPhones it's supported but less reliable —
+  it can still close if the screen fully locks, not just when switching
+  apps, so it's worth trying on each person's actual phone.
+
 ## Firestore setup you still need to do
 
 1. In the Firebase console for `phone-2f357`, make sure **Firestore Database**
@@ -110,10 +145,21 @@ access) will not work over plain HTTP except on `localhost`.
 
 ## Known limitations worth knowing about
 
-- **No push notifications.** A device only "hears" a ring while the app/tab is
-  open — there's no service-worker push wired up, so a phone with the app
-  closed in the background won't ring. If you want true background ringing,
-  that's a bigger addition (Web Push + a notification permission flow).
+- **Still no true "app fully closed" ringing.** A device only "hears" a ring
+  while the app/tab is open somewhere (even in the background) — there's no
+  service-worker push wired up, so a phone with the app fully closed won't
+  ring. If you want true ring-when-closed, that's a bigger addition (Web
+  Push + a notification permission flow, or Firebase Cloud Messaging).
+- **Calls go quiet if you leave the app entirely.** This is intentional
+  behavior built into phones, not a bug: iOS and Android both cut off a
+  website's microphone/camera the moment you switch to a different app or
+  press the home button, as a privacy protection. Every other browser-based
+  calling app (Zoom, Google Meet, etc., used in a browser rather than their
+  native app) has this exact same limitation. Keeping this app open and in
+  front for the length of the call — like you would with any calling app —
+  keeps the call live. The wake lock added above stops the screen from
+  sleeping *on its own*, which was the single biggest cause of calls
+  dropping unexpectedly.
 - **No TURN server.** Only public STUN servers are configured. Most home/
   cellular networks connect fine peer-to-peer, but some strict corporate or
   carrier NATs can block the direct connection entirely. If family members

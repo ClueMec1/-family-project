@@ -188,6 +188,84 @@ const Tone = {
 document.addEventListener("pointerdown", () => Tone.ensureCtx(), { once: true, passive: true });
 
 /* ============================================================
+   3b. Screen Wake Lock
+   The single biggest cause of "the call went silent" on a phone is simply
+   the screen locking itself from inactivity mid-call — once the screen
+   sleeps, the browser throttles the page and audio drops. This keeps the
+   screen awake for as long as a call is on-screen (ringing, dialing, or
+   connected), so the person doesn't have to remember to tap the screen.
+   It does NOT keep a call alive if someone deliberately switches to a
+   different app or presses the home button — phones intentionally pause
+   microphone/camera access the moment an app leaves the foreground, as a
+   privacy protection, and no website can override that. Keeping this app
+   open and in front, like any other calling app, is what keeps the call live.
+   ============================================================ */
+const WakeLock = {
+  sentinel: null,
+  async acquire() {
+    if (!("wakeLock" in navigator)) return;
+    try {
+      this.sentinel = await navigator.wakeLock.request("screen");
+      this.sentinel.addEventListener("release", () => { this.sentinel = null; });
+    } catch (err) {
+      // Can fail if the tab isn't visible yet or the OS declines it — not fatal,
+      // the call still works, the screen just might sleep on its own.
+      console.warn("wake lock not acquired:", err);
+    }
+  },
+  async release() {
+    if (this.sentinel) {
+      try { await this.sentinel.release(); } catch {}
+      this.sentinel = null;
+    }
+  },
+};
+
+// The browser automatically drops the wake lock whenever the tab is hidden
+// (e.g. switching tabs, not the call itself). Re-acquire it the moment the
+// tab is visible again, but only if a call is still actually in progress.
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible" && CallManager.callId) {
+    WakeLock.acquire();
+  }
+});
+
+/* ============================================================
+   3c. Incoming-call notifications
+   Shows a real browser/system notification when a call comes in while this
+   tab isn't the one on screen (another tab, another window, or the phone's
+   app switcher). This still needs the app to be open *somewhere* — a fully
+   closed app or browser can't be woken up this way. Waking a fully closed
+   app for a call needs push notifications wired through a server (Firebase
+   Cloud Messaging), which is a separate, bigger addition — see README.
+   ============================================================ */
+const Notify = {
+  async requestPermission() {
+    if (!("Notification" in window)) return;
+    if (Notification.permission === "default") {
+      try { await Notification.requestPermission(); } catch {}
+    }
+  },
+  incoming(peer) {
+    if (!("Notification" in window)) return;
+    if (Notification.permission !== "granted") return;
+    if (document.visibilityState === "visible") return; // already looking at it — the on-screen ring is enough
+    try {
+      const title = peer.name ? `${peer.name} is calling` : `Incoming call: ${formatNumber(peer.number)}`;
+      const n = new Notification(title, {
+        body: "Newman Phone Line",
+        icon: "icons/icon-192.png",
+        tag: "npl-incoming-call",
+        requireInteraction: true,
+      });
+      n.onclick = () => { window.focus(); n.close(); };
+    } catch (err) {
+      console.warn("notification failed:", err);
+    }
+  },
+};
+
+/* ============================================================
    4. App state
    ============================================================ */
 const App = {
@@ -627,6 +705,118 @@ const Profile = {
 };
 
 /* ============================================================
+   10b. Mini window (Picture-in-Picture)
+   Lets a call keep going in a small floating window while the person
+   switches to other apps — the browser's own Picture-in-Picture feature,
+   normally used for video. There's no video in an audio call, so this
+   draws a small "call card" (name + timer) onto a canvas and feeds that
+   in as a silent picture; the real call audio still comes through the
+   separate hidden <audio> element untouched.
+   Works well on Android Chrome and desktop Chrome/Edge. iOS Safari
+   supports it too, but less reliably — it can still close once the phone's
+   screen fully locks, not just when switching apps. Worth testing on each
+   family member's actual phone.
+   ============================================================ */
+const PiP = {
+  canvas: null,
+  ctx: null,
+  video: null,
+  drawTimer: null,
+
+  ensureElements() {
+    if (this.video) return;
+    this.canvas = document.createElement("canvas");
+    this.canvas.width = 400;
+    this.canvas.height = 225;
+    this.ctx = this.canvas.getContext("2d");
+
+    this.video = document.createElement("video");
+    this.video.muted = true;
+    this.video.setAttribute("playsinline", "true");
+    this.video.style.position = "fixed";
+    this.video.style.width = "1px";
+    this.video.style.height = "1px";
+    this.video.style.opacity = "0";
+    this.video.style.pointerEvents = "none";
+    document.body.appendChild(this.video);
+
+    this.video.addEventListener("leavepictureinpicture", () => this.stop());
+  },
+
+  draw() {
+    const ctx = this.ctx, w = this.canvas.width, h = this.canvas.height;
+    ctx.fillStyle = "#0F2B25";
+    ctx.fillRect(0, 0, w, h);
+
+    const peer = CallManager.peer || {};
+    const label = peer.name || (peer.number ? formatNumber(peer.number) : "Newman Line");
+    const cx = w / 2, cy = h / 2 - 22, r = 34;
+
+    ctx.fillStyle = peer.color || "#C9A227";
+    ctx.beginPath();
+    ctx.arc(cx, cy, r, 0, Math.PI * 2);
+    ctx.fill();
+
+    ctx.fillStyle = "#FBF8F2";
+    ctx.font = "600 22px Georgia, serif";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText(initials(label), cx, cy + 1);
+
+    ctx.font = "600 17px Georgia, serif";
+    ctx.fillText(label, cx, cy + r + 24);
+
+    ctx.fillStyle = "#E4CD7C";
+    ctx.font = "12.5px Arial, sans-serif";
+    const statusEl = $("#incall-status");
+    const status = CallManager.timerInterval
+      ? fmtTimer((Date.now() - CallManager.timerStart) / 1000)
+      : (statusEl ? statusEl.textContent : "on a call");
+    ctx.fillText(status, cx, cy + r + 46);
+  },
+
+  supported() {
+    return !!(document.pictureInPictureEnabled || (this.video && this.video.webkitSupportsPresentationMode));
+  },
+
+  async start() {
+    this.ensureElements();
+    if (!this.supported()) {
+      toast("Mini window isn't supported on this browser.", true);
+      return;
+    }
+    this.draw();
+    try {
+      this.video.srcObject = this.canvas.captureStream(2);
+      await this.video.play();
+      if (this.video.requestPictureInPicture) {
+        await this.video.requestPictureInPicture();
+      } else if (this.video.webkitSetPresentationMode) {
+        this.video.webkitSetPresentationMode("picture-in-picture");
+      } else {
+        throw new Error("no PiP method on this browser");
+      }
+      clearInterval(this.drawTimer);
+      this.drawTimer = setInterval(() => this.draw(), 500);
+      toast("Call minimized — keep an eye on the little window while you use other apps.");
+    } catch (err) {
+      console.warn("PiP failed:", err);
+      toast("Couldn't open the mini window on this device.", true);
+    }
+  },
+
+  stop() {
+    clearInterval(this.drawTimer);
+    this.drawTimer = null;
+    if (document.pictureInPictureElement) {
+      document.exitPictureInPicture().catch(() => {});
+    } else if (this.video && this.video.webkitSetPresentationMode && this.video.webkitPresentationMode === "picture-in-picture") {
+      try { this.video.webkitSetPresentationMode("inline"); } catch {}
+    }
+  },
+};
+
+/* ============================================================
    11. WebRTC call manager (Firestore-signaled)
    ============================================================ */
 const ICE_SERVERS = [
@@ -662,6 +852,7 @@ const CallManager = {
     $("#end-call-btn").addEventListener("click", () => this.hangup("ended"));
     $("#mute-btn").addEventListener("click", () => this.toggleMute());
     $("#speaker-btn").addEventListener("click", () => this.toggleSpeaker());
+    $("#pip-btn").addEventListener("click", () => PiP.start());
   },
 
   cleanupSubs() {
@@ -710,6 +901,8 @@ const CallManager = {
     $("#incoming-number").textContent = this.peer.name ? formatNumber(this.peer.number) : (this.peer.bio || "");
     showScreen("screen-incoming");
     Tone.startRingtone();
+    WakeLock.acquire();
+    Notify.incoming(this.peer);
 
     // Watch the call doc so we notice if the caller hangs up before we answer.
     const { db, doc, onSnapshot } = await getFB();
@@ -959,6 +1152,7 @@ const CallManager = {
     $("#mute-btn").classList.toggle("on", this.muted);
     $("#speaker-btn").classList.toggle("on", this.speaker);
     showScreen("screen-incall");
+    WakeLock.acquire();
   },
 
   startTimer() {
@@ -1011,6 +1205,8 @@ const CallManager = {
 
   endCall() {
     Tone.stop();
+    WakeLock.release();
+    PiP.stop();
     clearTimeout(this.ringTimeout);
     clearInterval(this.timerInterval);
     this.timerInterval = null;
@@ -1045,6 +1241,7 @@ const Main = {
     showScreen("screen-main");
     Tabs.activate("keypad");
     CallManager.listenForIncomingCalls();
+    Notify.requestPermission();
   },
 };
 
