@@ -41,13 +41,23 @@ input:focus, button:focus-visible {
 
 #app {
   max-width: 480px;
+  width: 100%;
   margin: 0 auto;
+  /* 100svh = the height guaranteed visible even when a browser's address bar
+     or toolbar is showing. Using dvh here caused the app to size itself to a
+     taller, momentary measurement (toolbar hidden) that then got clipped —
+     with buttons at the bottom cut off — once the toolbar reappeared. */
   height: 100vh;
-  height: 100dvh;
+  height: 100svh;
   position: relative;
-  overflow: hidden;
+  overflow-y: auto;
+  overflow-x: hidden;
   background: var(--cream);
   box-shadow: 0 0 60px rgba(0,0,0,0.35);
+}
+
+@media (min-width: 700px) {
+  #app { max-width: 560px; }
 }
 
 .screen {
@@ -163,8 +173,12 @@ input:focus, button:focus-visible {
 .tab-panel.active { display: flex; }
 
 /* Keypad */
-#tab-keypad { justify-content: space-between; padding: 18px 20px calc(16px + var(--safe-bottom)); align-items: center; }
-.dial-display { width: 100%; padding: 18px 4px 6px; text-align: center; }
+#tab-keypad {
+  justify-content: space-between;
+  padding: clamp(8px, 3vh, 18px) 20px calc(clamp(10px, 2.5vh, 16px) + var(--safe-bottom));
+  align-items: center;
+}
+.dial-display { width: 100%; padding: clamp(8px, 2.5vh, 18px) 4px 6px; text-align: center; }
 .dial-entry {
   width: 100%; border: none; background: transparent; text-align: center;
   font-size: 30px; font-variant-numeric: tabular-nums; letter-spacing: 0.03em;
@@ -172,14 +186,14 @@ input:focus, button:focus-visible {
 }
 .dial-entry::placeholder { color: var(--ink-faint); font-size: 16px; }
 .keypad {
-  display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px;
-  width: 100%; max-width: 320px; margin: 0 auto;
+  display: grid; grid-template-columns: repeat(3, 1fr); gap: clamp(6px, 2.2vh, 12px);
+  width: 100%; max-width: min(320px, 84vw); margin: 0 auto;
 }
 .key {
   aspect-ratio: 1; border-radius: 50%; border: none;
   background: var(--cream-dim); color: var(--ink);
   display: flex; flex-direction: column; align-items: center; justify-content: center;
-  font-size: 24px; font-weight: 500; cursor: pointer;
+  font-size: clamp(18px, 3.6vh, 24px); font-weight: 500; cursor: pointer;
   transition: background 0.1s ease;
 }
 .key:active { background: #E4DDCC; }
@@ -187,10 +201,11 @@ input:focus, button:focus-visible {
 .key-ghost { background: transparent; color: var(--ink-soft); font-size: 20px; }
 .key-ghost:active { background: rgba(0,0,0,0.05); }
 .call-fab {
-  width: 66px; height: 66px; border-radius: 50%; border: none;
+  width: clamp(52px, 8.5vh, 66px); height: clamp(52px, 8.5vh, 66px); border-radius: 50%; border: none;
   background: var(--call-green); color: #fff; cursor: pointer;
   display: flex; align-items: center; justify-content: center;
-  margin-top: 18px; box-shadow: 0 8px 20px rgba(47,174,96,0.35);
+  margin-top: clamp(8px, 2vh, 18px); box-shadow: 0 8px 20px rgba(47,174,96,0.35);
+  flex-shrink: 0;
 }
 .call-fab svg { width: 26px; height: 26px; fill: currentColor; }
 .call-fab:disabled { background: #C7C2B6; box-shadow: none; }
