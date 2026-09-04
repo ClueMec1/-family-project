@@ -1,6 +1,0 @@
-{
-  "name": "family-hotline",
-  "version": "1.0.0",
-  "description": "Family Hotline — Telnyx + Firebase + Vercel",
-  "main": "api/menu.js"
-}
