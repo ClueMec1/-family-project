@@ -729,46 +729,64 @@ const CallManager = {
 
   async accept() {
     const callId = this.callId;
-    const offer = this.pendingOffer;
     Tone.stop();
     $("#incoming-avatar").classList.remove("pulsing");
 
     try {
-      this.localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    } catch (err) {
-      toast("Microphone access is needed to answer.", true);
-      this.decline();
-      return;
-    }
+      let offer = this.pendingOffer;
+      const { db, doc, getDoc, updateDoc, collection, addDoc, onSnapshot } = await getFB();
 
-    const { db, doc, updateDoc, collection, addDoc, onSnapshot } = await getFB();
-    this.pc = this.buildPeerConnection(callId, "calleeCandidates");
-    this.localStream.getTracks().forEach((t) => this.pc.addTrack(t, this.localStream));
+      // Defensive: if the offer somehow wasn't attached yet, re-fetch the call
+      // doc once before giving up, instead of failing silently.
+      if (!offer || !offer.sdp) {
+        const fresh = await getDoc(doc(db, "calls", callId));
+        offer = fresh.exists() ? fresh.data().offer : null;
+      }
+      if (!offer || !offer.sdp) {
+        throw new Error("No offer found on the call yet — the caller's connection may have dropped.");
+      }
 
-    await this.pc.setRemoteDescription(new RTCSessionDescription(offer));
-    const answer = await this.pc.createAnswer();
-    await this.pc.setLocalDescription(answer);
+      try {
+        this.localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      } catch (err) {
+        toast("Microphone access is needed to answer.", true);
+        this.decline();
+        return;
+      }
 
-    await updateDoc(doc(db, "calls", callId), {
-      answer: { type: answer.type, sdp: answer.sdp },
-      status: "active",
-    });
+      this.pc = this.buildPeerConnection(callId, "calleeCandidates");
+      this.pc._flushCandidates(); // the parent call doc already exists at this point
+      this.localStream.getTracks().forEach((t) => this.pc.addTrack(t, this.localStream));
 
-    const candUnsub = onSnapshot(collection(db, "calls", callId, "callerCandidates"), (snap) => {
-      snap.docChanges().forEach((ch) => {
-        if (ch.type === "added") this.pc.addIceCandidate(new RTCIceCandidate(ch.doc.data())).catch(() => {});
+      await this.pc.setRemoteDescription(new RTCSessionDescription(offer));
+      const answer = await this.pc.createAnswer();
+      await this.pc.setLocalDescription(answer);
+
+      await updateDoc(doc(db, "calls", callId), {
+        answer: { type: answer.type, sdp: answer.sdp },
+        status: "active",
       });
-    });
-    this.unsubs.push(candUnsub);
 
-    const docUnsub = onSnapshot(doc(db, "calls", callId), (snap) => {
-      const d = snap.data();
-      if (!d || d.status === "ended") this.hangup("ended-remote", false);
-    });
-    this.unsubs.push(docUnsub);
+      const candUnsub = onSnapshot(collection(db, "calls", callId, "callerCandidates"), (snap) => {
+        snap.docChanges().forEach((ch) => {
+          if (ch.type === "added") this.pc.addIceCandidate(new RTCIceCandidate(ch.doc.data())).catch(() => {});
+        });
+      });
+      this.unsubs.push(candUnsub);
 
-    this.showInCall("connected");
-    this.startTimer();
+      const docUnsub = onSnapshot(doc(db, "calls", callId), (snap) => {
+        const d = snap.data();
+        if (!d || d.status === "ended") this.hangup("ended-remote", false);
+      });
+      this.unsubs.push(docUnsub);
+
+      this.showInCall("connected");
+      this.startTimer();
+    } catch (err) {
+      console.error("accept() failed:", err);
+      toast("Couldn't connect that call — please try again.", true);
+      this.endCall();
+    }
   },
 
   async decline() {
@@ -804,7 +822,7 @@ const CallManager = {
     showScreen("screen-incall");
 
     try {
-      const { db, doc, getDoc, collection, addDoc, onSnapshot, serverTimestamp } = await getFB();
+      const { db, doc, getDoc, collection, setDoc, onSnapshot, serverTimestamp } = await getFB();
 
       // Look up the callee's registered name/color for a nicer display, if available.
       try {
@@ -825,26 +843,31 @@ const CallManager = {
         return;
       }
 
-      const callRef = await addDoc(collection(db, "calls"), {
-        callerNumber: App.profile.number,
-        callerName: App.profile.name,
-        callerBio: App.profile.bio || "",
-        callerColor: App.profile.color,
-        calleeNumber: number,
-        offer: null,
-        answer: null,
-        status: "ringing",
-        createdAt: serverTimestamp(),
-      });
-      this.callId = callRef.id;
+      // Pre-generate the call document's ID (without writing anything yet) so
+      // ICE candidates can be queued against it while we build the offer.
+      const callDocRef = doc(collection(db, "calls"));
+      this.callId = callDocRef.id;
 
       this.pc = this.buildPeerConnection(this.callId, "callerCandidates");
       this.localStream.getTracks().forEach((t) => this.pc.addTrack(t, this.localStream));
 
       const offer = await this.pc.createOffer();
       await this.pc.setLocalDescription(offer);
-      const { updateDoc } = await getFB();
-      await updateDoc(doc(db, "calls", this.callId), { offer: { type: offer.type, sdp: offer.sdp } });
+
+      // Only now — with the offer already in hand — does the call document get
+      // created, so the callee never sees a "ringing" call with no offer on it.
+      await setDoc(callDocRef, {
+        callerNumber: App.profile.number,
+        callerName: App.profile.name,
+        callerBio: App.profile.bio || "",
+        callerColor: App.profile.color,
+        calleeNumber: number,
+        offer: { type: offer.type, sdp: offer.sdp },
+        answer: null,
+        status: "ringing",
+        createdAt: serverTimestamp(),
+      });
+      this.pc._flushCandidates();
 
       Tone.startRingback();
 
@@ -896,16 +919,33 @@ const CallManager = {
 
   buildPeerConnection(callId, candidateCollectionName) {
     const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+    const pending = [];
+    let ready = false;
+
+    const writeCandidate = async (json) => {
+      try {
+        const { db, collection, addDoc } = await getFB();
+        await addDoc(collection(db, "calls", callId, candidateCollectionName), json);
+      } catch (err) { console.error("candidate write failed:", err); }
+    };
+
+    // The call doc may not exist yet when the very first candidates arrive
+    // (ICE gathering starts as soon as setLocalDescription runs, which can be
+    // before the Firestore write finishes). Queue candidates until told the
+    // parent document is safely written, then flush them in order.
+    pc._flushCandidates = () => {
+      ready = true;
+      while (pending.length) writeCandidate(pending.shift());
+    };
+
     pc.ontrack = (event) => {
       this.remoteAudio.srcObject = event.streams[0];
       this.remoteAudio.play().catch(() => {});
     };
-    pc.onicecandidate = async (event) => {
+    pc.onicecandidate = (event) => {
       if (!event.candidate) return;
-      try {
-        const { db, collection, addDoc } = await getFB();
-        await addDoc(collection(db, "calls", callId, candidateCollectionName), event.candidate.toJSON());
-      } catch (err) { console.error(err); }
+      const json = event.candidate.toJSON();
+      if (ready) writeCandidate(json); else pending.push(json);
     };
     return pc;
   },
