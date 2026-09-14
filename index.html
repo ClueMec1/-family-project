@@ -243,7 +243,7 @@
   </div>
 
   <script>
-    // Hardcoded Gemini Key
+    // Embedded Gemini API Key
     const GEMINI_API_KEY = "AQ.Ab8RN6Ls--vWFBC9xgElbdvLWbRXYeSIn0LTWHRVMFKmx8L2Hw";
 
     function toggleApiKeyInput() {
@@ -273,6 +273,7 @@
       generateBtn.disabled = true;
       spinner.style.display = 'block';
       statusText.innerText = 'Creating image... This might take a few seconds.';
+      statusText.style.display = 'block';
       resultImg.style.display = 'none';
       downloadBtn.style.display = 'none';
 
@@ -280,7 +281,7 @@
         let imageUrl = '';
 
         if (api === 'gemini') {
-          // Gemini 2.5 Flash Image (Nano Banana) REST Call
+          // REST endpoint for Gemini 2.5 Flash Image (Nano Banana)
           const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-image:generateContent?key=${GEMINI_API_KEY}`;
           
           const response = await fetch(url, {
@@ -289,10 +290,7 @@
             body: JSON.stringify({
               contents: [{
                 parts: [{ text: prompt }]
-              }],
-              generationConfig: {
-                responseMimeType: "image/jpeg"
-              }
+              }]
             })
           });
 
@@ -303,22 +301,26 @@
 
           const data = await response.json();
           
-          // Find base64 image data in Gemini response parts
+          // Parse base64 image data from candidates payload
           const parts = data.candidates?.[0]?.content?.parts || [];
           let base64Data = null;
+          let mimeType = 'image/jpeg';
           
           for (const part of parts) {
             if (part.inlineData && part.inlineData.data) {
               base64Data = part.inlineData.data;
+              if (part.inlineData.mimeType) {
+                mimeType = part.inlineData.mimeType;
+              }
               break;
             }
           }
 
           if (!base64Data) {
-            throw new Error('No image payload received from Gemini.');
+            throw new Error('No image payload returned by Gemini.');
           }
 
-          imageUrl = `data:image/jpeg;base64,${base64Data}`;
+          imageUrl = `data:${mimeType};base64,${base64Data}`;
 
         } else if (api === 'pollinations') {
           // Pollinations.ai API URL
